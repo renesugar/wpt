@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<title>Test the video.requestVideoFrameCallback() API for non visible video elements.</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+
+</body>
+<script>
+var testVideo = {
+  url: getVideoURI('/media/movie_5'),
+  height: 240,
+  width: 320,
+}
+
+async_test(function(t) {
+    let video = document.createElement('video');
+    document.body.appendChild(video);
+
+    var detachFromParent = function() {
+      video.requestVideoFrameCallback(t.step_func_done());
+      video.parentNode.removeChild(video);
+
+      // Wait one turn of the event loop, to make sure the transition to paused
+      // completes first.
+      t.step_timeout(_ => { video.play(); });
+    }
+
+    video.src = testVideo.url;
+    video.play().then(_ => {
+      // Calling rVFC() before play() can result in a DOMException from this
+      // call to play() being immediately interrupted by a pause().
+      video.requestVideoFrameCallback(t.step_func(detachFromParent));
+    });
+
+}, 'Test we can detach a video from its parent and still use video.rVFC.');
+
+var styleTest = function(applyStyle) {
+    return function(t) {
+        let video = document.createElement('video');
+        document.body.appendChild(video);
+        applyStyle(video);
+
+        video.requestVideoFrameCallback(
+          t.step_func( _ => {
+            // Make sure we can receive more than one callback.
+            video.requestVideoFrameCallback(t.step_func_done());
+          })
+        );
+
+        video.src = testVideo.url;
+        video.play();
+    }
+}
+
+async_test(styleTest((video) => { video.style.display = "none"}),
+ 'Test video.rVFC works with "display:none".');
+
+async_test(styleTest((video) => { video.style.visibility = "hidden"}),
+ 'Test video.rVFC works with "visibility:hidden".');
+
+</script>
+</html>
