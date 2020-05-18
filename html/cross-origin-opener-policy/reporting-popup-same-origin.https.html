@@ -1,0 +1,314 @@
+
+<!doctype html>
+<meta charset=utf-8>
+<meta name=timeout content=long>
+<script src=/resources/testharness.js></script>
+<script src=/resources/testharnessreport.js></script>
+<script src="/common/get-host-info.sub.js"></script>
+<script src="resources/common.js"></script>
+
+<div id=log></div>
+<script>
+
+// Allows RegExps to be pretty printed.
+Object.defineProperty(RegExp.prototype, "toJSON", {
+  value: RegExp.prototype.toString
+});
+
+function wait(ms) {
+  return new Promise(resolve => step_timeout(resolve, ms));
+}
+
+async function pollReports(endpoint) {
+  const res = await fetch(`resources/report.py?endpoint=${endpoint.name}`, {cache: 'no-store'});
+  if (res.status !== 200) {
+    return;
+  }
+  for (const report of await res.json()) {
+    endpoint.reports.push(report);
+  }
+}
+
+function isObjectAsExpected(report, expected_report) {
+  if((report === undefined || report === null || expected_report === undefined || expected_report === null)
+      && report !== expected_report )
+    return false;
+
+  if(expected_report instanceof RegExp && typeof report === "string") {
+    return expected_report.test(report);
+  }
+
+  // Perform this check now, as RegExp and strings above have different typeof.
+  if(typeof report !== typeof expected_report)
+    return false;
+
+  if(typeof expected_report === 'object') {
+    return Object.keys(expected_report).every(key => {
+      return isObjectAsExpected(report[key], expected_report[key]);
+    });
+  }
+
+  return report == expected_report;
+}
+
+async function checkForExpectedReport(expected_report) {
+  return new Promise( async (resolve, reject) => {
+    const polls = 10;
+    const waitTime = 200;
+    for(var i=0; i < polls; ++i) {
+      pollReports(expected_report.endpoint);
+      if(expected_report.endpoint.reports.some((report) => { return isObjectAsExpected(report, expected_report.report); }))
+        resolve();
+      await wait(waitTime);
+    }
+    reject("No report matched the expected report for endpoint: " + expected_report.endpoint.name
+      + ", expected report: " + JSON.stringify(expected_report.report)
+      + ", within available reports: " + JSON.stringify(expected_report.endpoint.reports)
+    );
+  });
+}
+
+async function checkForUnwantedReport(unwanted_report) {
+  return new Promise( async (resolve, reject) => {
+    const polls = 10;
+    const waitTime = 200;
+    for(var i=0; i < polls; ++i) {
+      pollReports(unwanted_report.endpoint);
+      unwanted_report.endpoint.reports.forEach((report) => {
+        if(isObjectAsExpected(report, unwanted_report.report)) {
+          reject("Report matched the unwanted report for endpoint: " + unwanted_report.endpoint.name
+            + ", unwanted report: " + JSON.stringify(unwanted_report.report)
+            + ", matched: " + JSON.stringify(report)
+          );
+        }
+      });
+      await wait(waitTime);
+    }
+    resolve();
+  });
+}
+
+function replace_from_regex_or_string(str, match, value) {
+  if(str instanceof RegExp) {
+    return RegExp(str.source.replace(match, value));
+  }
+  return str.replace(match, value);
+}
+
+function replace_values_in_expected_report(expected_report, channelName) {
+  if(expected_report.report.body !== undefined) {
+    if(expected_report.report.body["document-uri"] !== undefined) {
+      expected_report.report.body["document-uri"] = replace_from_regex_or_string(expected_report.report.body["document-uri"], "CHANNEL_NAME", channelName);
+    }
+    if(expected_report.report.body["navigation-uri"] !== undefined) {
+      expected_report.report.body["navigation-uri"] = replace_from_regex_or_string(expected_report.report.body["navigation-uri"], "CHANNEL_NAME", channelName);
+    }
+  }
+  if(expected_report.report.url !== undefined) {
+      expected_report.report.url = replace_from_regex_or_string(expected_report.report.url, "CHANNEL_NAME", channelName);
+  }
+  return expected_report;
+}
+
+function coop_reporting_test(host, coop, coep, channelName, hasOpener, expected_reports, unexpected_reports){
+  promise_test(async t=> {
+    await new Promise( async resolve => {
+      coop_coep_test(t, host, coop, coep, channelName,
+          hasOpener, undefined /* openerDOMAccess */, resolve);
+    });
+    expected_reports = Array.from(expected_reports, report => replace_values_in_expected_report(report, channelName) );
+    unexpected_reports = Array.from(unexpected_reports, report => replace_values_in_expected_report(report, channelName) );
+    await Promise.all(
+        Array.from(expected_reports, checkForExpectedReport).concat(
+          Array.from(unexpected_reports, checkForUnwantedReport))
+    );
+  }, `coop reporting test ${channelName}`);
+}
+
+const reportEndpoint = {
+  name: "coop-report-endpoint",
+  reports: []
+}
+const popupReportEndpoint = {
+  name: "coop-popup-report-endpoint",
+  reports: []
+}
+
+
+const documentCOOPValueTitle = "reporting-same-origin";
+
+let tests = [
+  // popup origin, popup COOP, popup COEP, expected opener, expected reports, unwanted reports
+  // Open and navigate a popup to a same-origin page: no browsing context group switch, no report.
+  [ SAME_ORIGIN, `same-origin; report-to="${popupReportEndpoint.name}"`, "", true, [], [
+      {"endpoint":reportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": `${location.href}`,
+          "effective-policy":"same-origin",
+          "navigation-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "violation-type":"navigation-from-document"
+        },
+        "url": `${location.href}`,
+        "type": "coop"
+      }},
+      {"endpoint":popupReportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "effective-policy":"same-origin",
+          "navigation-uri": `${location.href}`,
+          "violation-type":"navigation-to-document"
+        },
+        "url": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+        "type": "coop"
+      }}
+    ]
+  ],
+  // Cross origin popup, report the browsing context group switch to all required endpoints.
+  [ CROSS_ORIGIN, `same-origin; report-to="${popupReportEndpoint.name}"`, "", false, [
+      {"endpoint":reportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": `${location.href}`,
+          "effective-policy":"same-origin",
+          "navigation-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/, // initial navigation URL
+          "violation-type":"navigation-from-document"
+        },
+        "url": `${location.href}`,
+        "type": "coop"
+      }},
+      {"endpoint":popupReportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "effective-policy":"same-origin",
+          "navigation-uri": `${location.href}`, // referrer
+          "violation-type":"navigation-to-document"
+        },
+        "url": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+        "type": "coop"
+      }}
+    ],
+    []
+  ],
+  // Open and navigate a popup to a same-origin without COOP page: two reports.
+  // Verifies that unsafe-none can specify a reporting endpoint.
+  [ SAME_ORIGIN, `unsafe-none; report-to="${popupReportEndpoint.name}"`, "", false, [
+      {"endpoint":reportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": `${location.href}`,
+          "effective-policy":"same-origin",
+          "navigation-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "violation-type":"navigation-from-document"
+        },
+        "url": `${location.href}`,
+        "type": "coop"
+      }},
+      {"endpoint":popupReportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "effective-policy":"unsafe-none",
+          "navigation-uri": `${location.href}`,
+          "violation-type":"navigation-to-document"
+        },
+        "url": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+        "type": "coop"
+      }}
+    ],
+    []
+  ],
+  // Cross origin popup, report the browsing context group switch to all required endpoints.
+  // Verifies that unsafe-none can specify a reporting endpoint.
+  [ CROSS_ORIGIN, `unsafe-none; report-to="${popupReportEndpoint.name}"`, "", false, [
+      {"endpoint":reportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": `${location.href}`,
+          "effective-policy":"same-origin",
+          "navigation-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/, // initial navigation URL
+          "violation-type":"navigation-from-document"
+        },
+        "url": `${location.href}`,
+        "type": "coop"
+      }},
+      {"endpoint":popupReportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "effective-policy":"unsafe-none",
+          "navigation-uri": `${location.href}`, // referrer
+          "violation-type":"navigation-to-document"
+        },
+        "url": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+        "type": "coop"
+      }}
+    ],
+    []
+  ],
+  // Same origin popup, without COOP or reporting, report only sent to opener.
+  [ SAME_ORIGIN, "unsafe-none", "", false,
+    [
+      {"endpoint":reportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": `${location.href}`,
+          "effective-policy":"same-origin",
+          "navigation-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "violation-type":"navigation-from-document"
+        },
+        "url": `${location.href}`,
+        "type": "coop"
+      }}
+    ],
+    [
+      {"endpoint":popupReportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "effective-policy":"unsafe-none",
+          "navigation-uri": `${location.href}`,
+          "violation-type":"navigation-to-document"
+        },
+        "url": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+        "type": "coop"
+      }}
+    ]
+  ],
+  // Cross origin popup, without COOP or reporting, report only sent to opener.
+  [ CROSS_ORIGIN, "unsafe-none", "", false,
+    [
+      {"endpoint":reportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": `${location.href}`,
+          "effective-policy":"same-origin",
+          "navigation-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "violation-type":"navigation-from-document"
+        },
+        "url": `${location.href}`,
+        "type": "coop"
+      }}
+    ],
+    [
+      {"endpoint":popupReportEndpoint, "report": {
+        "body":{
+          "disposition":"enforce",
+          "document-uri": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+          "effective-policy":"unsafe-none",
+          "navigation-uri": `${location.href}`,
+          "violation-type":"navigation-to-document"
+        },
+        "url": /coop-coep.py?.*channel=CHANNEL_NAME$/,
+        "type": "coop"
+      }}
+    ]
+  ],
+];
+tests.forEach( test => {
+  coop_reporting_test(test[0], test[1], test[2], `${documentCOOPValueTitle}_to_${test[0].name}_${test[1].replace(/[ ;"=]/g,"-")}`, test[3], test[4], test[5]);
+});
+
+</script>
